@@ -692,7 +692,13 @@ fn inboundDispatcherThread(
             typing_recipient,
         );
 
-        const use_streaming_outbound = std.mem.eql(u8, msg.channel, "web");
+        const use_streaming_outbound = blk: {
+            const ch_opt = if (outbound_account_id) |aid|
+                registry.findByNameAccount(msg.channel, aid)
+            else
+                registry.findByName(msg.channel);
+            break :blk if (ch_opt) |ch| ch.vtable.sendEvent != null else false;
+        };
         var streaming_ctx = StreamingOutboundCtx{
             .allocator = allocator,
             .event_bus = event_bus,
