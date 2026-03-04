@@ -206,6 +206,8 @@ pub const TelegramConfig = struct {
     interactive: TelegramInteractiveConfig = .{},
     /// When true, only respond to messages that @mention the bot (in groups).
     require_mention: bool = false,
+    /// When true, stream partial responses to private chats via sendMessageDraft while generating.
+    stream_drafts: bool = true,
 };
 
 pub const DiscordConfig = struct {
