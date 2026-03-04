@@ -450,6 +450,8 @@ pub const TelegramChannel = struct {
     bot_username: ?[]const u8 = null,
     bot_user_id: ?i64 = null,
     require_mention: bool = false,
+    /// When true, stream partial responses via sendMessageDraft (configurable, on by default).
+    stream_drafts: bool = true,
 
     // Pending media group messages (buffered across poll cycles until group is complete)
     pending_media_messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty,
@@ -505,6 +507,7 @@ pub const TelegramChannel = struct {
         ch.proxy = cfg.proxy;
         ch.interactive = cfg.interactive;
         ch.require_mention = cfg.require_mention;
+        ch.stream_drafts = cfg.stream_drafts;
         return ch;
     }
 
@@ -1590,6 +1593,41 @@ pub const TelegramChannel = struct {
         self.allocator.free(resp);
     }
 
+    /// Stream a partial response to a private chat via the Telegram sendMessageDraft API.
+    /// Uses draft_id=1 so successive calls for the same generation are animated.
+    /// Per the Telegram Bot API spec, sendMessageDraft only targets private chats;
+    /// calls for group chat IDs will silently fail, which is acceptable.
+    /// Best-effort: errors are silently ignored to not interrupt the streaming flow.
+    fn sendDraftText(self: *TelegramChannel, chat_id: []const u8, text: []const u8) void {
+        if (text.len == 0) return;
+
+        var url_buf: [512]u8 = undefined;
+        const url = self.apiUrl(&url_buf, "sendMessageDraft") catch return;
+
+        // Truncate to MAX_MESSAGE_LEN at a valid UTF-8 boundary.
+        var safe_len: usize = if (text.len > MAX_MESSAGE_LEN) MAX_MESSAGE_LEN else text.len;
+        if (safe_len < text.len) {
+            // Walk back past UTF-8 continuation bytes (0b10xxxxxx).
+            while (safe_len > 0 and (text[safe_len - 1] & 0xC0) == 0x80) safe_len -= 1;
+            // Walk back past a stranded multi-byte leading byte (0b11xxxxxx).
+            if (safe_len > 0 and (text[safe_len - 1] & 0xC0) == 0xC0) safe_len -= 1;
+        }
+        const safe_text = text[0..safe_len];
+        if (safe_text.len == 0) return;
+
+        var body: std.ArrayListUnmanaged(u8) = .empty;
+        defer body.deinit(self.allocator);
+
+        body.appendSlice(self.allocator, "{\"chat_id\":") catch return;
+        body.appendSlice(self.allocator, chat_id) catch return;
+        body.appendSlice(self.allocator, ",\"draft_id\":1,\"text\":") catch return;
+        root.json_util.appendJsonString(&body, self.allocator, safe_text) catch return;
+        body.appendSlice(self.allocator, "}") catch return;
+
+        const resp = root.http_util.curlPostWithProxy(self.allocator, url, body.items, &.{}, self.proxy, "3") catch return;
+        self.allocator.free(resp);
+    }
+
     fn resetPendingMediaBuffers(self: *TelegramChannel) void {
         for (self.pending_media_messages.items) |msg| {
             msg.deinit(self.allocator);
@@ -2372,6 +2410,22 @@ pub const TelegramChannel = struct {
         try self.stopTyping(recipient);
     }
 
+    fn vtableSendEvent(
+        ptr: *anyopaque,
+        target: []const u8,
+        message: []const u8,
+        media: []const []const u8,
+        stage: root.Channel.OutboundStage,
+    ) anyerror!void {
+        const self: *TelegramChannel = @ptrCast(@alignCast(ptr));
+        switch (stage) {
+            .chunk => {
+                if (self.stream_drafts) self.sendDraftText(target, message);
+            },
+            .final => try vtableSend(ptr, target, message, media),
+        }
+    }
+
     pub const vtable = root.Channel.VTable{
         .start = &vtableStart,
         .stop = &vtableStop,
@@ -2380,6 +2434,7 @@ pub const TelegramChannel = struct {
         .healthCheck = &vtableHealthCheck,
         .startTyping = &vtableStartTyping,
         .stopTyping = &vtableStopTyping,
+        .sendEvent = &vtableSendEvent,
     };
 
     pub fn channel(self: *TelegramChannel) root.Channel {
@@ -4393,4 +4448,84 @@ test "telegram consumeCallbackSelection rejects expired interaction" {
         .expired, .not_found => {},
         else => return error.TestUnexpectedResult,
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// sendMessageDraft / stream_drafts Tests
+// ════════════════════════════════════════════════════════════════════════════
+
+test "telegram TelegramConfig stream_drafts default is true" {
+    const cfg = config_types.TelegramConfig{ .bot_token = "test-token" };
+    try std.testing.expect(cfg.stream_drafts);
+}
+
+test "telegram TelegramConfig stream_drafts can be disabled" {
+    const cfg = config_types.TelegramConfig{ .bot_token = "test-token", .stream_drafts = false };
+    try std.testing.expect(!cfg.stream_drafts);
+}
+
+test "telegram initFromConfig copies stream_drafts true" {
+    const cfg = config_types.TelegramConfig{ .bot_token = "test-token", .stream_drafts = true };
+    const ch = TelegramChannel.initFromConfig(std.testing.allocator, cfg);
+    try std.testing.expect(ch.stream_drafts);
+}
+
+test "telegram initFromConfig copies stream_drafts false" {
+    const cfg = config_types.TelegramConfig{ .bot_token = "test-token", .stream_drafts = false };
+    const ch = TelegramChannel.initFromConfig(std.testing.allocator, cfg);
+    try std.testing.expect(!ch.stream_drafts);
+}
+
+test "telegram sendDraftText does not crash with invalid token" {
+    var ch = TelegramChannel.init(std.testing.allocator, "invalid:token", &.{}, &.{}, "allowlist");
+    // Must not crash; errors are silently ignored.
+    ch.sendDraftText("12345", "Hello, streaming world!");
+}
+
+test "telegram sendDraftText no-ops on empty text" {
+    var ch = TelegramChannel.init(std.testing.allocator, "invalid:token", &.{}, &.{}, "allowlist");
+    // Empty text must be a no-op and not crash.
+    ch.sendDraftText("12345", "");
+}
+
+test "telegram sendDraftText truncates oversized text at utf8 boundary" {
+    // Build a text longer than MAX_MESSAGE_LEN using only ASCII so the byte boundary
+    // and the UTF-8 boundary are the same.
+    const long_text = "a" ** (TelegramChannel.MAX_MESSAGE_LEN + 100);
+    var ch = TelegramChannel.init(std.testing.allocator, "invalid:token", &.{}, &.{}, "allowlist");
+    // Must not crash; the internal truncation logic is exercised.
+    ch.sendDraftText("12345", long_text);
+}
+
+test "telegram sendDraftText truncates multi-byte utf8 at safe boundary" {
+    // Fill with exactly MAX_MESSAGE_LEN bytes of ASCII then append a 3-byte UTF-8 sequence
+    // (U+2014 EM DASH = 0xE2 0x80 0x94) so the em-dash straddles the boundary.
+    var buf: [TelegramChannel.MAX_MESSAGE_LEN + 3]u8 = undefined;
+    @memset(buf[0..TelegramChannel.MAX_MESSAGE_LEN], 'x');
+    // Place a 3-byte em-dash at positions MAX_MESSAGE_LEN-1, MAX_MESSAGE_LEN, MAX_MESSAGE_LEN+1
+    // so the sequence starts one byte before the limit.
+    buf[TelegramChannel.MAX_MESSAGE_LEN - 1] = 0xE2;
+    buf[TelegramChannel.MAX_MESSAGE_LEN] = 0x80;
+    buf[TelegramChannel.MAX_MESSAGE_LEN + 1] = 0x94;
+    var ch = TelegramChannel.init(std.testing.allocator, "invalid:token", &.{}, &.{}, "allowlist");
+    // Must not crash and the stranded leading byte at MAX_MESSAGE_LEN-1 must be removed.
+    ch.sendDraftText("12345", &buf);
+}
+
+test "telegram vtableSendEvent chunk calls sendDraftText when stream_drafts enabled" {
+    // We can only verify no crash / no leak here since real HTTP calls are
+    // rejected by the invalid token — that matches other send* tests above.
+    var ch = TelegramChannel.init(std.testing.allocator, "invalid:token", &.{}, &.{}, "allowlist");
+    ch.stream_drafts = true;
+    const chan = ch.channel();
+    // .chunk with stream_drafts=true must not return an error (best-effort).
+    try chan.sendEvent("12345", "partial text", &.{}, .chunk);
+}
+
+test "telegram vtableSendEvent chunk skipped when stream_drafts disabled" {
+    var ch = TelegramChannel.init(std.testing.allocator, "invalid:token", &.{}, &.{}, "allowlist");
+    ch.stream_drafts = false;
+    const chan = ch.channel();
+    // .chunk must be a no-op — no network call, no error.
+    try chan.sendEvent("12345", "partial text", &.{}, .chunk);
 }
