@@ -11,6 +11,7 @@ const session_mod = @import("session.zig");
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 const providers = @import("providers/root.zig");
 const memory_mod = @import("memory/root.zig");
+const bootstrap_mod = @import("bootstrap/root.zig");
 const observability = @import("observability.zig");
 const tools_mod = @import("tools/root.zig");
 const mcp = @import("mcp.zig");
@@ -19,6 +20,7 @@ const health = @import("health.zig");
 const daemon = @import("daemon.zig");
 const security = @import("security/policy.zig");
 const subagent_mod = @import("subagent.zig");
+const subagent_runner = @import("subagent_runner.zig");
 const agent_routing = @import("agent_routing.zig");
 const provider_runtime = @import("providers/runtime_bundle.zig");
 
@@ -329,6 +331,7 @@ pub const ChannelRuntime = struct {
     provider_bundle: provider_runtime.RuntimeProviderBundle,
     tools: []const tools_mod.Tool,
     mem_rt: ?memory_mod.MemoryRuntime,
+    bootstrap_provider: ?bootstrap_mod.BootstrapProvider,
     noop_obs: *observability.NoopObserver,
     subagent_manager: ?*subagent_mod.SubagentManager,
     policy_tracker: *security.RateTracker,
@@ -356,6 +359,7 @@ pub const ChannelRuntime = struct {
         errdefer if (subagent_manager) |mgr| allocator.destroy(mgr);
         if (subagent_manager) |mgr| {
             mgr.* = subagent_mod.SubagentManager.init(allocator, config, null, .{});
+            mgr.task_runner = subagent_runner.runTaskWithTools;
             errdefer {
                 mgr.deinit();
             }
@@ -380,6 +384,19 @@ pub const ChannelRuntime = struct {
             .tracker = policy_tracker,
         };
 
+        // Optional memory backend
+        var mem_rt = memory_mod.initRuntime(allocator, &config.memory, config.workspace_dir);
+        errdefer if (mem_rt) |*rt| rt.deinit();
+        const mem_opt: ?memory_mod.Memory = if (mem_rt) |rt| rt.memory else null;
+
+        const bootstrap_provider: ?bootstrap_mod.BootstrapProvider = bootstrap_mod.createProvider(
+            allocator,
+            config.memory.backend,
+            mem_opt,
+            config.workspace_dir,
+        ) catch null;
+        errdefer if (bootstrap_provider) |bp| bp.deinit();
+
         // Tools
         const tools = tools_mod.allTools(allocator, config.workspace_dir, .{
             .http_enabled = config.http_request.enabled,
@@ -398,13 +415,10 @@ pub const ChannelRuntime = struct {
             .allowed_paths = config.autonomy.allowed_paths,
             .policy = security_policy,
             .subagent_manager = subagent_manager,
+            .bootstrap_provider = bootstrap_provider,
+            .backend_name = config.memory.backend,
         }) catch &.{};
         errdefer if (tools.len > 0) tools_mod.deinitTools(allocator, tools);
-
-        // Optional memory backend
-        var mem_rt = memory_mod.initRuntime(allocator, &config.memory, config.workspace_dir);
-        errdefer if (mem_rt) |*rt| rt.deinit();
-        const mem_opt: ?memory_mod.Memory = if (mem_rt) |rt| rt.memory else null;
 
         // Noop observer (heap for vtable stability)
         const noop_obs = try allocator.create(observability.NoopObserver);
@@ -425,6 +439,7 @@ pub const ChannelRuntime = struct {
             .provider_bundle = runtime_provider,
             .tools = tools,
             .mem_rt = mem_rt,
+            .bootstrap_provider = bootstrap_provider,
             .noop_obs = noop_obs,
             .subagent_manager = subagent_manager,
             .policy_tracker = policy_tracker,
@@ -444,6 +459,7 @@ pub const ChannelRuntime = struct {
         const alloc = self.allocator;
         self.session_mgr.deinit();
         if (self.tools.len > 0) tools_mod.deinitTools(alloc, self.tools);
+        if (self.bootstrap_provider) |bp| bp.deinit();
         if (self.subagent_manager) |mgr| {
             mgr.deinit();
             alloc.destroy(mgr);

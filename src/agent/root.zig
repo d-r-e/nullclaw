@@ -18,6 +18,7 @@ const tools_mod = @import("../tools/root.zig");
 const Tool = tools_mod.Tool;
 const memory_mod = @import("../memory/root.zig");
 const Memory = memory_mod.Memory;
+const bootstrap_mod = @import("../bootstrap/root.zig");
 const capabilities_mod = @import("../capabilities.zig");
 const multimodal = @import("../multimodal.zig");
 const platform = @import("../platform.zig");
@@ -225,6 +226,7 @@ pub const Agent = struct {
     tools: []const Tool,
     tool_specs: []const ToolSpec,
     mem: ?Memory,
+    bootstrap: ?bootstrap_mod.BootstrapProvider = null,
     session_store: ?memory_mod.SessionStore = null,
     response_cache: ?*cache.ResponseCache = null,
     /// Optional MemoryRuntime pointer for diagnostics (e.g. /doctor command).
@@ -361,12 +363,20 @@ pub const Agent = struct {
             };
         }
 
+        const bootstrap_provider: ?bootstrap_mod.BootstrapProvider = bootstrap_mod.createProvider(
+            allocator,
+            cfg.memory.backend,
+            mem,
+            cfg.workspace_dir,
+        ) catch null;
+
         return .{
             .allocator = allocator,
             .provider = provider_i,
             .tools = tools,
             .tool_specs = specs,
             .mem = mem,
+            .bootstrap = bootstrap_provider,
             .observer = observer_i,
             .model_name = default_model,
             .default_provider = cfg.default_provider,
@@ -409,6 +419,7 @@ pub const Agent = struct {
     }
 
     pub fn deinit(self: *Agent) void {
+        if (self.bootstrap) |bp| bp.deinit();
         if (self.model_name_owned) self.allocator.free(self.model_name);
         if (self.default_provider_owned) self.allocator.free(self.default_provider);
         if (self.exec_node_id_owned and self.exec_node_id != null) self.allocator.free(self.exec_node_id.?);
@@ -437,6 +448,7 @@ pub const Agent = struct {
             .token_limit = self.token_limit,
             .max_history_messages = self.max_history_messages,
             .workspace_dir = self.workspace_dir,
+            .bootstrap_provider = self.bootstrap,
         });
     }
 
@@ -683,7 +695,7 @@ pub const Agent = struct {
         };
 
         // Inject system prompt on first turn (or when tracked workspace files changed).
-        const workspace_fp: ?u64 = prompt.workspacePromptFingerprint(self.allocator, self.workspace_dir) catch null;
+        const workspace_fp: ?u64 = prompt.workspacePromptFingerprint(self.allocator, self.workspace_dir, self.bootstrap) catch null;
         if (self.has_system_prompt and workspace_fp != null and self.workspace_prompt_fingerprint != workspace_fp) {
             self.has_system_prompt = false;
         }
@@ -710,6 +722,7 @@ pub const Agent = struct {
                 .tools = self.tools,
                 .capabilities_section = capabilities_section,
                 .conversation_context = self.conversation_context,
+                .bootstrap_provider = self.bootstrap,
             });
             defer self.allocator.free(system_prompt);
 
@@ -817,7 +830,7 @@ pub const Agent = struct {
             const messages = try self.buildProviderMessages(arena);
 
             const timer_start = std.time.milliTimestamp();
-            const is_streaming = self.stream_callback != null and self.provider.supportsStreaming();
+            const is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
             const native_tools_enabled = !is_streaming and self.provider.supportsNativeTools();
 
             // Call provider: streaming (no retries, no native tools) or blocking with retry
@@ -1042,8 +1055,16 @@ pub const Agent = struct {
                 assistant_history_content = response_text;
             }
 
-            // Determine display text
-            const display_text = if (parsed_text.len > 0) parsed_text else response_text;
+            // Determine display text.
+            // When tool calls are present, only show parsed plain text (if any).
+            // Never fall back to raw response_text here, otherwise markup like
+            // <tool_call>...</tool_call> can leak to users.
+            const display_text = if (parsed_calls.len > 0)
+                parsed_text
+            else if (parsed_text.len > 0)
+                parsed_text
+            else
+                response_text;
 
             if (parsed_calls.len == 0) {
                 // Guardrail: if the model promises "I'll try/check now" but emits no
@@ -4191,6 +4212,105 @@ test "Agent streaming fields can be set" {
 
     try std.testing.expect(agent.stream_callback != null);
     try std.testing.expect(agent.stream_ctx != null);
+}
+
+test "Agent falls back to blocking chat when stream ctx is missing" {
+    const allocator = std.testing.allocator;
+
+    const StreamGuardProvider = struct {
+        chat_calls: usize = 0,
+        stream_calls: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator_: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator_.dupe(u8, "ok");
+        }
+
+        fn chat(ptr: *anyopaque, allocator_: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!ChatResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.chat_calls += 1;
+            return .{
+                .content = try allocator_.dupe(u8, "ok"),
+                .tool_calls = &.{},
+                .usage = .{},
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn supportsStreaming(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn streamChat(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: providers.ChatRequest,
+            _: []const u8,
+            _: f64,
+            _: providers.StreamCallback,
+            _: *anyopaque,
+        ) anyerror!providers.StreamChatResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.stream_calls += 1;
+            return error.ShouldNotStream;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "stream-guard";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    var provider_state = StreamGuardProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = StreamGuardProvider.chatWithSystem,
+        .chat = StreamGuardProvider.chat,
+        .supportsNativeTools = StreamGuardProvider.supportsNativeTools,
+        .getName = StreamGuardProvider.getName,
+        .deinit = StreamGuardProvider.deinitFn,
+        .supports_streaming = StreamGuardProvider.supportsStreaming,
+        .stream_chat = StreamGuardProvider.streamChat,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const test_cb: providers.StreamCallback = struct {
+        fn cb(_: *anyopaque, _: providers.StreamChunk) void {}
+    }.cb;
+    agent.stream_callback = test_cb;
+    agent.stream_ctx = null;
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("ok", response);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.chat_calls);
+    try std.testing.expectEqual(@as(usize, 0), provider_state.stream_calls);
 }
 
 test "Agent shouldForceActionFollowThrough detects english deferred promise" {
